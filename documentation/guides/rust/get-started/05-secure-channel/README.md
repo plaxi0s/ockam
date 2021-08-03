@@ -168,3 +168,8 @@ cargo run --example 05-secure-channel-over-two-transport-hops-initiator
 Note the message flow.
 
 <img src="./sequence.png" width="100%">
+
+<div style="display: none; visibility: hidden;">
+<hr><b>Next:</b> <a href="../06-hub#readme">04. Hub</a>
+</div>
+
