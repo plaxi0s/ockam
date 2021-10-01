@@ -14,31 +14,11 @@ use ockam_core::compat::vec::Vec;
 
 use pin_utils::pin_mut;
 
-use crate::alloc_bump::Alloc;
-
-/// Reserved memory for the bump allocator
-const HEAP_SIZE: usize = 1024 * 128;
-
-static mut ALLOCATOR: UnsafeCell<MaybeUninit<Alloc>> = UnsafeCell::new(MaybeUninit::uninit());
-
-/// abort
-#[cfg(target_arch = "arm")]
-pub use cortex_m::asm::udf as abort;
-
-/// abort
-#[cfg(not(target_arch = "arm"))]
-pub fn abort() -> ! {
-    loop {
-        panic!();
-    }
-}
-
 /// Returns current executor.
 /// WARNING: this is not thread-safe
 pub fn current() -> &'static Executor<'static> {
     static INIT: AtomicBool = AtomicBool::new(false);
     static mut EXECUTOR: UnsafeCell<MaybeUninit<Executor>> = UnsafeCell::new(MaybeUninit::uninit());
-    static mut MEMORY: [u8; HEAP_SIZE] = [0; HEAP_SIZE];
 
     if INIT.load(Ordering::Relaxed) {
         unsafe { &*(EXECUTOR.get() as *const Executor) }
@@ -46,8 +26,6 @@ pub fn current() -> &'static Executor<'static> {
         unsafe {
             let executorp = EXECUTOR.get() as *mut Executor;
             executorp.write(Executor::new());
-            let allocatorp = ALLOCATOR.get() as *mut Alloc;
-            allocatorp.write(Alloc::new(&mut MEMORY));
             atomic::compiler_fence(Ordering::Release);
             INIT.store(true, Ordering::Relaxed);
             &*executorp
@@ -57,11 +35,8 @@ pub fn current() -> &'static Executor<'static> {
 
 /// Executor
 pub struct Executor<'a> {
-    tasks: UnsafeCell<Vec<&'a Task>>,
-
+    tasks: UnsafeCell<Vec<Box<Task>>>,
     task_queue: Arc<SegQueue<TaskId>>,
-    task_cache: Arc<Mutex<BTreeMap<TaskId, &'a Task>>>,
-
     marker: core::marker::PhantomData<&'a ()>,
 }
 
@@ -69,10 +44,7 @@ impl<'a> Executor<'a> {
     pub fn new() -> Self {
         Self {
             tasks: UnsafeCell::new(Vec::new()),
-
             task_queue: Arc::new(SegQueue::new()),
-            task_cache: Arc::new(Mutex::new(BTreeMap::new())),
-
             marker: core::marker::PhantomData,
         }
     }
@@ -93,9 +65,13 @@ impl<'a> Executor<'a> {
                 }
             }
 
-            let len = unsafe { (*self.tasks.get()).len() };
+            let tasks = unsafe {
+                let tasksp = self.tasks.get() as *mut Vec<Box<Task>>;
+                &mut (*tasksp)
+            };
+            let len = tasks.len();
             for i in 0..len {
-                let task = unsafe { (*self.tasks.get()).get_unchecked(i) };
+                let task = unsafe { tasks.get_unchecked(i) };
                 if task.ready.load(Ordering::Acquire) {
                     task.ready.store(false, Ordering::Release);
                     let waker = unsafe {
@@ -109,7 +85,6 @@ impl<'a> Executor<'a> {
                     }
                 }
             }
-
             self.sleep_if_idle();
         };
         result
@@ -117,15 +92,8 @@ impl<'a> Executor<'a> {
 
     /// spawn
     pub fn spawn(&self, future: impl Future + 'static) {
-        let task: &'static mut Task = Task::new(future);
-        self.task_queue.push(task.id);
-
-        let mut guard = self.task_cache.lock().unwrap();
-        if guard.insert(task.id, task).is_some() {
-            panic!("task with same ID already in tasks");
-        }
-
-        unsafe { (*self.tasks.get()).push(task) };
+        let task_id = Task::allocate(self, future);
+        self.task_queue.push(task_id);
     }
 
     fn sleep_if_idle(&self) {
@@ -151,19 +119,22 @@ where
 }
 
 impl Task {
-    fn new(future: impl Future + 'static) -> &'static mut Self {
+    fn allocate(executor: &Executor, future: impl Future + 'static) -> TaskId {
+        let task_id = TaskId::new();
         let task = Node {
-            id: TaskId::new(),
+            id: task_id.clone(),
             ready: AtomicBool::new(true),
             future: UnsafeCell::new(async {
                 // task terminating
                 future.await;
             }),
         };
+
         unsafe {
-            let allocator = ALLOCATOR.get() as *mut Alloc;
-            (*allocator).alloc_init(task)
+            (*executor.tasks.get()).push(Box::new(task));
         }
+
+        task_id
     }
 }
 
